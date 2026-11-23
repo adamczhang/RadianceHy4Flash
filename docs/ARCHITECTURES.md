@@ -3777,8 +3777,8 @@ stager's smallest pass, startup line `prefill staging`), not 4097. Cold prefill 
 | `busy-prefill-chunk: 1024` | 675 / 684 ms | 670 / 676 ms | 36.1 / 23.0 | 15.1 / 14.8 s |
 | **`busy-prefill-chunk: 512`** (2 runs) | 455, 445 / 503, 513 ms | 374, 369 / 418, 422 ms | 37.0, 44.0 / 26.7, 26.3 | 16.1, 15.4 / 16.9, 16.7 s |
 | `busy-prefill-chunk: 256` | 384 / 444 ms | 270 / 348 ms | 44.9 / 28.0 | 21.6 / 24.6 s |
-| `mixed-step-target-ms: 300` (2 runs) | 422, 385 / 374, 407 ms | 311, 303 / 317, 332 ms | 39.9, 37.8 / 27.5, 28.0 | 19.8, 20.5 / 25.4, 25.4 s |
-| `mixed-step-target-ms: 150` | 406 / 254 ms | 163 / 174 ms | 45.5 / 33.3 | 30.7 / 55.5 s |
+| `mixed-step-target-ms: 300` (2 runs, before the stager-floor clamp) | 422, 385 / 374, 407 ms | 311, 303 / 317, 332 ms | 39.9, 37.8 / 27.5, 28.0 | 19.8, 20.5 / 25.4, 25.4 s |
+| `mixed-step-target-ms: 150` (before the stager-floor clamp) | 406 / 254 ms | 163 / 174 ms | 45.5 / 33.3 | 30.7 / 55.5 s |
 | `prefill-interleave: 0` | 712 / 710 ms | 712 / 710 ms | 7.7 / 7.4 | 5.0 / 5.5 s |
 | `prefill-interleave: 2` | 717 / 714 ms | 714 / 712 ms | 17.3 / 15.0 | 6.1 / 7.1 s |
 | `prefill-interleave: auto:2` | 795 / 716 ms | 706 / 712 ms | 47.4 / 30.7 | 14.3 / 15.7 s |
@@ -3789,8 +3789,12 @@ how often decoders get a step between chunks (decode rate in the window, TTFT) b
 stays 0.71 s). Recommendation for interactive multi-user serving: `busy-prefill-chunk: 512`, which halves the stall (p99 0.71 to
 0.37-0.42 s) for +60 % arrival TTFT and no change in cold prefill; it is below the stager's 1024-token step, so startup warns
 and a chunk that is held back reads its routed experts synchronously (the arrival prefills slower, not the idle server).
-`mixed-step-target-ms: 300` gives the same stall (0.39-0.42 s) without the warning but 2.5x TTFT; 150 and 256 buy a further
-0.1-0.2 s for 2-5x TTFT and are not recommended. Keep `auto` for a server whose arrivals matter more than the decoders' cadence
+`mixed-step-target-ms: 300` gave the same stall (0.39-0.42 s) without the warning but 2.5x TTFT; 150 and 256 buy a further
+0.1-0.2 s for 2-5x TTFT and are not recommended. Both mixed-step rows predate the stager floor: the learned cap pushed its
+chunks under the 1024-row step there, where the routed experts are read synchronously. The scheduler now never sizes a mixed
+chunk under the stager floor (one quantum when the model arms no stager), missing a target shorter than one floor-sized step
+rather than breaking the floor, so this knob now runs between the `busy-prefill-chunk: 1024` row (0.67-0.68 s of stall) and
+`auto`, and both rows are to be re-taken on a lane. Keep `auto` for a server whose arrivals matter more than the decoders' cadence
 (batch or agent traffic): there is no setting below about 0.37 s of stall in this sweep, and nothing here changes a greedy
 token. Prefix cache and KV pool are unchanged (configuration only).
 

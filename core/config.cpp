@@ -79,7 +79,8 @@ static const Flag g_flags[] = {
                                         "(0 under --deterministic, KL mode, generators)" },
     { "--mixed-step-target-ms", "N",    "soft duration target in milliseconds for a mixed prefill/decode\n"
                                         "step. The scheduler learns an aggregate prefill cap from\n"
-                                        "completed mixed steps; 0 (default) is off" },
+                                        "completed mixed steps and never sizes a chunk under the\n"
+                                        "prefill stager's smallest step; 0 (default) is off" },
     { "--prefill-room-gate",  "MODE",   "on: a fresh prefill starts only when its whole prompt plus one\n"
                                         "decode position fits beside every runner; off (the default)\n"
                                         "admits a prompt when its first chunk fits" },

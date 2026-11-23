@@ -1607,14 +1607,16 @@ teach a model-agnostic controller an aggregate prefill-row cap. The cap is share
 prefills in that step, decode rows are reserved first, and a lone prefill remains unchanged. This
 is a soft service-time target, not a request deadline: timing starts when the engine issues the
 step and ends after its forward and speculative-drafter work. Queueing, HTTP transport and the
-client are outside it, and the legal chunk quantum, fixed decode cost, media passes or host jitter
-can make the target unattainable.
+client are outside it, and the legal chunk quantum or the stager floor, fixed decode cost, media
+passes or host jitter can make the target unattainable.
 
 The controller starts at one quarter of the model's shared-step capacity, corrects an over-target
 representative chunk immediately, and grows cautiously after three clearly under-target samples.
 A true prompt tail does not change the learned cap; a checkpoint or fixed busy-chunk boundary does,
-because the prompt continues and a lower cap can shorten its next step. If the target is lower than
-one legal mixed step, the cap bottoms out at one prefill quantum and misses remain visible. Startup
+because the prompt continues and a lower cap can shorten its next step. A mixed chunk never goes
+under the smallest step the prefill stager overlaps (one quantum when the model arms no stager),
+since below it every routed layer reads its pooled experts synchronously; a target shorter than one
+such step therefore bottoms out at the stager floor and its misses remain visible. Startup
 refuses configurations whose token budget or explicit busy cap cannot carry one legal prefill
 quantum beside a decode row. When the batch budget cannot carry one quantum for every simultaneous
 prefill, equal sharing applies to the requests that fit and the scheduler's priority/arrival order
