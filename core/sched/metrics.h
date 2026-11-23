@@ -247,9 +247,9 @@ private:
  * most a quarter of the measured headroom. A one-quantum probe lets a conservative cap recover
  * when fixed decode cost makes proportional scaling alone predict no larger legal chunk.
  *
- * The controller is deliberately model-agnostic. It may take a cap below an expert stager's
- * throughput floor: satisfying an explicitly requested latency target while decoders are active
- * is the point of the flag. With the flag off no caller consults it. */
+ * The controller is deliberately model-agnostic. The scheduler clamps a chunk it sizes at the
+ * prefill stager's smallest step (busy_cap), so a cap below that floor runs at the floor and its
+ * target misses stay visible in the counters. With the flag off no caller consults it. */
 struct MixedStepTarget {
     void reset() { cap_ = 0; good_ = 0; }
 

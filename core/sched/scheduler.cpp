@@ -184,7 +184,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         m_.mixed_step_target_prefill_cap = mixed_target_.cap();
         RAD_INFO("scheduler: --mixed-step-target-ms %lld: completed mixed steps teach an adaptive "
                  "aggregate prefill-row cap; while another sequence decodes the cap starts at "
-                 "%lld rows and aims for a full mixed-step duration near %lld ms (a soft target)",
+                 "%lld rows, aims for a full mixed-step duration near %lld ms (a soft target), "
+                 "and never sizes a chunk under the prefill stager's smallest step",
                  (long long)cfg.mixed_step_target_ms, (long long)mixed_target_.cap(),
                  (long long)cfg.mixed_step_target_ms);
     }
@@ -1503,12 +1504,19 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
         cap = std::min(cap, budget - mixed_target_decode_reserve);
     if (mixed_target_active_ && mixed_target_.cap() > 0) {
         mixed_target_shares = std::max<int64_t>(0, mixed_target_shares);
+        /* The learned cap may not push a chunk under the prefill stager's smallest step: below it
+         * every routed layer reads its pooled experts synchronously, which costs a long prefill
+         * far more than the shorter step buys (set_stage_rows warns about the same for an explicit
+         * cap). A target shorter than one floor-sized step is then missed rather than broken, and
+         * the misses stay visible in the counters. */
+        const int64_t floor_share = std::max(Q, stage_rows_ / Q * Q);
         /* Share the aggregate allowance evenly among this prefill and those expected later in
          * the step. Stable queue order must not let the first request consume the cap while the
-         * others receive only a minimum quantum on every step. If the learned cap cannot hold
-         * one quantum apiece, the effective allowance grows just enough to make progress; this
-         * may miss an impossible target, but it cannot silently starve a queued prompt. */
-        const int64_t floor = mixed_target_prefill_planned_ + (mixed_target_shares + 1) * Q;
+         * others receive only the floor on every step. If the learned cap cannot hold the floor
+         * apiece, the effective allowance grows just enough to make progress; this may miss an
+         * impossible target, but it cannot silently starve a queued prompt. */
+        const int64_t floor = mixed_target_prefill_planned_ +
+                              (mixed_target_shares + 1) * floor_share;
         const int64_t allowance = std::max(mixed_target_.cap(), floor);
         const int64_t left = std::max<int64_t>(0, allowance - mixed_target_prefill_planned_);
         const int64_t participants = mixed_target_shares + 1;

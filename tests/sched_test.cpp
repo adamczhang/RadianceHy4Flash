@@ -3915,6 +3915,75 @@ TEST(a_mixed_step_target_preserves_speculative_verification_in_a_mixed_step) {
     CHECK_EQ(rd->n_accepted, 2);
 }
 
+/* The learned cap may not push a mixed chunk under the prefill stager's smallest step: below it
+ * every routed layer reads its pooled experts synchronously, which costs a long prefill far more
+ * than the shorter step buys (set_stage_rows warns about the same for an explicit cap). The seed
+ * (a quarter of the batch budget) and a cap the target learns are both below the floor here, and
+ * the step still runs a whole floor-sized chunk; the target misses stay visible in the counters. */
+TEST(a_mixed_step_target_clamps_its_cap_at_the_stager_floor) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/4096);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.busy_prefill_chunk = 0;          /* the target controller stands on its own */
+    f.cfg.mixed_step_target_ms = 2;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1025);            /* a held-back chunk keeps 1024 rows */
+
+    f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    const uint64_t p = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 512);   /* the seed, under the floor */
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (e.seq != p || !e.is_prefill) continue;
+        CHECK_EQ(e.n_tokens, 1024);        /* the stager floor, not the seed's 512 */
+    }
+    f.commit_plain(12);
+    f.sch.note_mixed_step_cost(12000000);  /* 12 ms against a 2 ms target: the cap falls to 128 */
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 128);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_misses, 1);
+
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (e.seq != p || !e.is_prefill) continue;
+        CHECK_EQ(e.n_tokens, 1024);        /* still the floor: the learned cap cannot go under it */
+    }
+    f.commit_plain(13);
+    f.sch.note_mixed_step_cost(12000000);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_misses, 2);   /* the clamped target keeps missing */
+}
+
+/* With no stager armed there is no floor to hold: the one-quantum minimum is the whole clamp. */
+TEST(a_mixed_step_target_keeps_one_quantum_with_no_stager_armed) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/4096);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.busy_prefill_chunk = 0;
+    f.cfg.mixed_step_target_ms = 2;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(0);
+
+    f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    f.commit_plain(12);
+    f.sch.note_mixed_step_cost(12000000);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 64);
+
+    CHECK(f.sch.step() != nullptr);
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (e.seq != p || !e.is_prefill) continue;
+        CHECK_EQ(e.n_tokens, 64);
+    }
+}
+
 TEST(a_mixed_step_target_composes_with_auto_interleave_and_burst_prefills) {
     Fixture f;
     share_fixture(f, /*busy off: the target controller stands on its own=*/0);
