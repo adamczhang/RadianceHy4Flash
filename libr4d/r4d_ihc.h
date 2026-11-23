@@ -65,6 +65,43 @@ __device__ __forceinline__ void acc_piece(float (&acc)[R + 1], const float (&f)[
     }
 }
 
+// finish's two halves for the row groups (K-46; finish itself is left as it was, so the
+// one-row kernels compile as before). finish_part: the lanes of each sum (r4d_xor_sum<32>), a wave's into `part`.
+template <int R>
+__device__ __forceinline__ void finish_part(const float (&acc)[R + 1], float (*part)[R + 1]) {
+    const uint32_t lane = threadIdx.x & 31u, wave = threadIdx.x >> 5;
+#pragma unroll
+    for (int k = 0; k <= R; ++k) {
+        const float s = r4d_xor_sum<32>(acc[k]);
+        if (lane == 0) part[wave][k] = s;
+    }
+}
+// finish_gates, one thread: the waves' sums from 0.0f in wave order, r, the gates (into `gate`) and
+// the write weights (into `post_row` when POST).
+template <int HC, bool POST>
+__device__ __forceinline__ void finish_gates(float (*part)[(POST ? 2 * HC : HC) + 1], float* gate,
+                                             const float* __restrict__ scale,
+                                             const float* __restrict__ base,
+                                             float* __restrict__ post_row, uint32_t width, float eps,
+                                             float heps, float pmag) {
+    constexpr int R = POST ? 2 * HC : HC;
+    float s[R + 1];
+#pragma unroll
+    for (int k = 0; k <= R; ++k) {
+        float v = 0.0f;
+        for (int w = 0; w < kWaves; ++w) v += part[w][k];
+        s[k] = v;
+    }
+    const float inv = 1.0f / sqrtf(s[R] / (float)width + eps);
+#pragma unroll
+    for (int j = 0; j < HC; ++j) gate[j] = sigmoid(s[j] * inv * scale[0] + base[j]) + heps;
+    if constexpr (POST) {
+#pragma unroll
+        for (int j = 0; j < HC; ++j)
+            post_row[j] = pmag * sigmoid(s[HC + j] * inv * scale[1] + base[HC + j]) + heps;
+    }
+}
+
 // The lanes, then the waves through `part`; one thread forms r, the gates (into `gate`) and the
 // write weights (into `post_row` when POST). Every thread calls; a barrier on entry to `part`'s
 // reads and one behind the gates, so `gate` is readable on return.
@@ -256,6 +293,224 @@ __device__ __forceinline__ void junction_row(JuncLds<HC, POST>& L, uint16_t* ybu
             __syncthreads();
             q8_row_had_i8g<kThreads>(ybuf, r.cq, r.cs, n);
         }
+    }
+}
+
+// ------------------------------------------------------------------ rows in groups (K-46)
+// Long prefill only, in a kernel of its own (ihc_junction_group_kernel, r4d_ihc_bf16.hip): a block
+// takes its rows G at a time, the group's inputs in G consecutive ybufs, and every fn word loaded
+// once a piece serves each row of the group. Each row keeps its own sums, added in junction_row's
+// order (the pieces ascending, the eight values of a piece ascending, then the same lane and wave
+// reductions), so a row's bytes are junction_row's whatever the group, the block count or the
+// partition. With fp-contract off no interleaving of the rows' independent sums can change them.
+// The barriers of steps 1 and 3 are the group's: one behind the post loads, one per norm, one before
+// the gates, one behind them.
+//
+// Everything else runs upstream's one-row kernel unchanged (ihc_junction_kernel over junction_row,
+// and the all-reduce twins): decode, every height below kJuncGroupMinRows, tail 0, the odd hc, and
+// rows too wide for G ybufs. The first version (577dd089) shared one kernel between both and grew
+// every instance's registers (256 VGPRs at hc 4, 5 waves a SIMD, decode +19 %, prefill +101 %).
+//
+// G is 2 (R4D_JUNC_GROUP, 1 to 4, sets it for a lane to compare; 1 turns grouping off). Bounded to
+// the one-row kernel's occupancy (junction_group_waves), 2 rows compile without a VGPR spill at hc
+// 2, 4 and 8; 3 and 4 rows spill there (hc 4 with post: 62 to 93 VGPRs to scratch), and unbounded
+// they cost occupancy instead (577dd089: 256 VGPRs, 5 waves a SIMD).
+//
+// kJuncGroupMinRows (R4D_JUNC_MIN_ROWS for a lane's sweep) keeps decode, verify and short prefill on
+// the one-row kernel: 2048 rows give the grouped kernel 1024 blocks, many times what the card holds
+// at once, and every long-prefill step of the TP4 deployment (2048 to 4096 rows) is at or above it.
+#ifndef R4D_JUNC_MIN_ROWS
+#define R4D_JUNC_MIN_ROWS 2048
+#endif
+enum { kJuncLdsBytes = 48 * 1024, kJuncGroupMinRows = R4D_JUNC_MIN_ROWS };
+#ifndef R4D_JUNC_GROUP
+#define R4D_JUNC_GROUP 2
+#endif
+static_assert(R4D_JUNC_GROUP >= 1 && R4D_JUNC_GROUP <= 4, "R4D_JUNC_GROUP is 1 to 4");
+// The group at hc streams: none at the odd counts (their one-row kernels already run at 8 to 12
+// waves a SIMD; a group's sums spill or halve that).
+__host__ __device__ constexpr int junction_group(int hc) {
+    return hc == 2 || hc == 4 || hc == 8 ? R4D_JUNC_GROUP : 1;
+}
+// The grouped kernel's register bound, in waves a SIMD (amdgpu_waves_per_eu's minimum; 1 is no
+// bound). R4D_JUNC_WAVES overrides it for a lane.
+#ifndef R4D_JUNC_WAVES
+#define R4D_JUNC_WAVES 0
+#endif
+__host__ __device__ constexpr int junction_group_waves(int hc, bool post) {
+    return R4D_JUNC_WAVES > 0 ? R4D_JUNC_WAVES
+                              : hc == 8 ? (post ? 9 : 12) : hc == 4 && post ? 12 : 16;
+}
+// Whether a launch takes the grouped kernel: the tail (fn to share), an even hc, G ybufs of n bf16
+// in kJuncLdsBytes, and at least kJuncGroupMinRows rows.
+__host__ inline bool junction_grouped(long long M, uint32_t n, bool tail, int hc) {
+    const int g = junction_group(hc);
+    return tail && g > 1 && (uint64_t)g * n * 2u <= (uint64_t)kJuncLdsBytes &&
+           M >= (long long)kJuncGroupMinRows;
+}
+
+// `r` advanced to `row` by the operands' row pitches.
+__device__ __forceinline__ JuncRow junction_at(JuncRow r, uint64_t row, uint64_t pp, uint64_t hp,
+                                              uint64_t xnp, uint64_t yp, uint64_t xp) {
+    r.post_row += row * pp;
+    r.hr += row * hp;
+    if (r.xnr) r.xnr += row * xnp;
+    if (r.cq) { r.cq += row * r.cqp; r.cs += row * r.csp; }
+    if (r.yr) r.yr += row * yp;
+    if (r.xr) r.xr += row * xp;
+    return r;
+}
+
+// junction_row (TAIL) over the rows row0 + [0, nr), 2 <= nr <= G, row i's input in
+// ybuf + i * n; `nr` is uniform over the block. Row i's sums and stores are junction_row's. The
+// rows' operands are formed from `r` (row 0's) and the pitches where they are used, not held: four
+// JuncRows would take some 150 scalar registers.
+template <int HC, bool POST, int G>
+__device__ __forceinline__ void junction_rows(JuncLds<HC, POST>* L, uint16_t* ybuf, const JuncRow& r0,
+                                              uint64_t row0, int nr, uint64_t pp, uint64_t hp,
+                                              uint64_t xnp, uint64_t yp, uint64_t xp) {
+    constexpr int R = POST ? 2 * HC : HC, RT = G;
+    const uint32_t t = threadIdx.x, n = r0.n;
+    auto row_of = [&](int i) { return junction_at(r0, row0 + (uint64_t)i, pp, hp, xnp, yp, xp); };
+    if (t < (uint32_t)HC) {
+#pragma unroll
+        for (int i = 0; i < RT; ++i)
+            if (i < nr) L[i].pv[t] = r0.post_row[(row0 + (uint64_t)i) * pp + t];
+    }
+    __syncthreads();   // the input rows in ybuf and pv
+    // 1. y = rmsnorm(input), back into each row's ybuf (norm_row's own barrier a row; a row's
+    //    reduction scratch is its own, so the next row's sum does not race this one's reads).
+#pragma unroll
+    for (int i = 0; i < RT; ++i) {
+        if (i >= nr) break;
+        const JuncRow r = row_of(i);
+        uint16_t* yb = ybuf + (uint32_t)i * n;
+        norm_row(yb, r.w_post, n, r.eps, r.wadd, r.mult, L[i].red1, [&](uint32_t q, uint4 w) {
+            *(uint4*)(yb + 8u * q) = w;
+            if (r.yr) *(uint4*)(r.yr + 8u * q) = w;
+        });
+    }
+    __syncthreads();
+    // 2. h += post * y a row, and every row's sums from one load of each fn word.
+    float acc[RT][R + 1];
+#pragma unroll
+    for (int i = 0; i < RT; ++i)
+#pragma unroll
+        for (int k = 0; k <= R; ++k) acc[i][k] = 0.0f;
+    const uint32_t pieces = (uint32_t)HC * n / 8u;
+    const float* __restrict__ fn = r0.fn;
+    const uint64_t fp = r0.fp;
+    uint16_t* const h0 = r0.hr + row0 * hp;
+    for (uint32_t p = t; p < pieces; p += kThreads) {
+        const uint32_t c0 = 8u * p, j = c0 / n, i0 = c0 - j * n;
+        float f[RT][8];
+#pragma unroll
+        for (int i = 0; i < RT; ++i) {
+            if (i >= nr) break;
+            float hf[8], yf[8];
+            uint16_t* const hr = h0 + (uint64_t)i * hp + c0;
+            unpack8(*(const uint4*)hr, hf);
+            unpack8(*(const uint4*)(ybuf + (uint32_t)i * n + i0), yf);
+            const float pj = L[i].pv[j];
+            uint16_t b[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                b[e] = f32_to_bf16(__fadd_rn(__fmul_rn(pj, yf[e]), hf[e]));
+                f[i][e] = bf16_to_f32(b[e]);
+            }
+            *(uint4*)hr = pack8(b);
+        }
+        // acc_piece<R, true>'s order a row: projection j, the eight values ascending, then f^2.
+#pragma unroll
+        for (int jj = 0; jj < R; ++jj) {
+            const float* __restrict__ fr = fn + (uint64_t)jj * fp + c0;
+            const float4 a = *(const float4*)fr, b = *(const float4*)(fr + 4);
+            const float w[8] = { a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w };
+#pragma unroll
+            for (int i = 0; i < RT; ++i) {
+                if (i >= nr) break;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) acc[i][jj] += w[e] * f[i][e];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < RT; ++i) {
+            if (i >= nr) break;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[i][R] += f[i][e] * f[i][e];
+        }
+    }
+    // 3. every row's lanes into its part, one barrier (it also publishes h), each row's gates by its
+    //    own thread (lane 0 of wave i), one barrier; the collapses, one barrier; the norms.
+#pragma unroll
+    for (int i = 0; i < RT; ++i) {
+        if (i >= nr) break;
+        finish_part<R>(acc[i], L[i].part);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < RT; ++i) {
+        if (i >= nr) break;
+        if (t == 32u * (uint32_t)i) {
+            const JuncRow r = row_of(i);
+            finish_gates<HC, POST>(L[i].part, L[i].gate, r.scale, r.base, r.post_row,
+                                   (uint32_t)HC * n, r.ieps, r.heps, r.pmag);
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < RT; ++i) {
+        if (i >= nr) break;
+        const JuncRow r = row_of(i);
+        uint16_t* yb = ybuf + (uint32_t)i * n;
+        collapse8<HC>(r.hr, L[i].gate, n, [&](uint32_t q, uint4 w) {
+            *(uint4*)(yb + 8u * q) = w;
+            if (r.xr) *(uint4*)(r.xr + 8u * q) = w;
+        });
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < RT; ++i) {
+        if (i >= nr) break;
+        const JuncRow r = row_of(i);
+        uint16_t* yb = ybuf + (uint32_t)i * n;
+        norm_row(yb, r.w_next, n, r.eps, r.wadd, r.mult, L[i].red2, [&](uint32_t q, uint4 w) {
+            *(uint4*)(r.xnr + 8u * q) = w;
+            if (r.cq) *(uint4*)(yb + 8u * q) = w;   // each thread its own words, read before
+        });
+    }
+    // G-3b: each row's codes, as junction_row writes them (cq is given for all rows or none).
+    if (r0.cq) {
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < RT; ++i) {
+            if (i >= nr) break;
+            const JuncRow r = row_of(i);
+            q8_row_had_i8g<kThreads>(ybuf + (uint32_t)i * n, r.cq, r.cs, n);
+        }
+    }
+}
+
+// A block's rows [r0, r1) (TAIL): `load(row, buf)` puts the row's input into `buf` (each thread its
+// own 8-column words, as junction_row expects); groups of G while two or more rows remain, then the
+// last row alone through junction_row. L holds G entries, ybuf G rows of n.
+template <int HC, bool POST, int G, class LOAD>
+__device__ __forceinline__ void junction_walk(JuncLds<HC, POST>* L, uint16_t* ybuf, const JuncRow& r,
+                                              int r0, int r1, uint64_t pp, uint64_t hp,
+                                              uint64_t xnp, uint64_t yp, uint64_t xp, LOAD load) {
+    static_assert(G >= 2, "junction_walk groups rows");
+    const uint32_t n = r.n;
+    int row = r0;
+    while (r1 - row > 1) {
+        const int nr = r1 - row < G ? r1 - row : G;
+        for (int i = 0; i < nr; ++i) load(row + i, ybuf + (uint32_t)i * n);
+        junction_rows<HC, POST, G>(L, ybuf, r, (uint64_t)row, nr, pp, hp, xnp, yp, xp);
+        __syncthreads();   /* ybuf and L are the next group's */
+        row += nr;
+    }
+    if (row < r1) {
+        load(row, ybuf);
+        junction_row<HC, POST, true>(L[0], ybuf, junction_at(r, (uint64_t)row, pp, hp, xnp, yp, xp));
     }
 }
 

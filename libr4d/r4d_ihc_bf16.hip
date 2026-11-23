@@ -147,6 +147,44 @@ __global__ __launch_bounds__(kThreads) void ihc_junction_kernel(
     if (blockIdx.x < M) ihc_junction_body<HC, POST, TAIL, ADD>(a, b, r, ap, bp, pp, hp, xnp, yp, xp);
     if (CH::on) r4d_chain_done();
 }
+// The grouped instance (K-46): long prefill only (r4d_ihc.h's junction_grouped), the tail always.
+// Block bk of `nbw` working blocks owns the rows [bk * M / nbw, (bk + 1) * M / nbw) and takes them G
+// at a time (junction_walk); the op's launch gives ceil(M / G) blocks, one group each. A row's bytes
+// are ihc_junction_kernel's whatever nbw. The register allocation is bounded to JW waves a SIMD
+// (junction_group_waves) so the group's sums cannot take the occupancy the one-row kernel has.
+// LDS: G rows of n bf16 + G JuncLds.
+template <int HC, bool POST, bool ADD, class CH, int G>
+__global__ __launch_bounds__(kThreads)
+__attribute__((amdgpu_waves_per_eu((junction_group_waves(HC, POST)), 16))) void ihc_junction_group_kernel(
+    uint16_t* __restrict__ a, const uint16_t* __restrict__ b, JuncRow r, uint64_t ap, uint64_t bp,
+    uint64_t pp, uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp, uint32_t M, uint32_t nbw) {
+    if (CH::on) r4d_chain_wait();
+    if (blockIdx.x < nbw) {
+        R4D_DYN_LDS(uint4, jbuf);
+        __shared__ JuncLds<HC, POST> L[G];
+        const uint64_t bk = blockIdx.x;
+        const int r0 = (int)(bk * M / nbw), r1 = (int)((bk + 1) * M / nbw);
+        junction_walk<HC, POST, G>(L, (uint16_t*)jbuf, r, r0, r1, pp, hp, xnp, yp, xp,
+                                   [&](int row, uint16_t* buf) {
+            uint16_t* __restrict__ ar = a + (uint64_t)row * ap;
+            for (uint32_t q = threadIdx.x; q < r.n / 8u; q += kThreads) {
+                uint4 w = *(const uint4*)(ar + 8u * q);
+                if (ADD) {
+                    float u[8], v[8];
+                    unpack8(w, u);
+                    unpack8(*(const uint4*)(b + (uint64_t)row * bp + 8u * q), v);
+                    uint16_t o[8];
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) o[e] = f32_to_bf16(u[e] + v[e]);
+                    w = pack8(o);
+                    *(uint4*)(ar + 8u * q) = w;
+                }
+                ((uint4*)buf)[q] = w;
+            }
+        });
+    }
+    if (CH::on) r4d_chain_done();
+}
 // h[j][i] = bf16(post[j] * y[i] + h[j][i]). The product is its own f32 rounding, as libref's.
 // Eight columns of every stream a thread when rows and pointers allow 16-byte accesses.
 template <bool VEC>
@@ -479,12 +517,8 @@ int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
     return RAD_OK;
 }
 
-extern "C" int r4d_rad_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
-    R4dIhcJunction j;
-    const int rc = r4d_ihc_junction_args(a, &j);
-    if (rc != RAD_OK) return R4D_NO(rc);
-    const bool add = j.b != nullptr;
-    const bool ch = r4d_geti_or(a, "chain", 0) != 0;
+/* Upstream's launch: one row a block (ihc_junction_kernel). */
+static int ihc_junction_launch_rows(const R4dIhcJunction& j, RadStream s, bool add, bool ch) {
     const uint32_t lds = j.r.n * 2u;
     const uint32_t grid = r4d_cliff_rows((uint32_t)j.M, 1, kWaves);   /* see ihc_pre_kernel */
 #define R4D_IJ_K(HC_, PO_, TA_, AD_, CH_)                                                          \
@@ -510,4 +544,54 @@ extern "C" int r4d_rad_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
 #undef R4D_IJ_A
 #undef R4D_IJ_C
 #undef R4D_IJ_K
+}
+
+/* The grouped launch over `nbw` working blocks (1..M): the tail at hc 2, 4 and 8 only. */
+static int ihc_junction_launch_group(const R4dIhcJunction& j, RadStream s, bool add, bool ch,
+                                     uint32_t nbw) {
+    constexpr int G = R4D_JUNC_GROUP < 2 ? 2 : R4D_JUNC_GROUP;
+    const uint32_t lds = (uint32_t)G * j.r.n * 2u;
+    const uint32_t grid = r4d_cliff_rows(nbw, 1, kWaves);   /* see ihc_pre_kernel */
+#define R4D_IJG_K(HC_, PO_, AD_, CH_)                                                              \
+    R4D_EMIT(s, (ihc_junction_group_kernel<HC_, PO_, AD_, CH_, G>), dim3(grid), dim3(kThreads),  \
+             lds, j.a, j.b, j.r, (uint64_t)j.ap, (uint64_t)j.bp, (uint64_t)j.pp, (uint64_t)j.hp,   \
+             (uint64_t)j.xnp, (uint64_t)j.yp, (uint64_t)j.xp, (uint32_t)j.M, nbw)
+#define R4D_IJG_C(HC_, PO_, AD_)                                                                   \
+    (ch ? R4D_IJG_K(HC_, PO_, AD_, r4dchain) : R4D_IJG_K(HC_, PO_, AD_, R4dUnchained))
+#define R4D_IJG_A(HC_, PO_) (add ? R4D_IJG_C(HC_, PO_, true) : R4D_IJG_C(HC_, PO_, false))
+#define R4D_IJG_HC(HC_) return j.post ? R4D_IJG_A(HC_, true) : R4D_IJG_A(HC_, false)
+    switch (j.hc) {
+        case 2: R4D_IJG_HC(2);
+        case 4: R4D_IJG_HC(4);
+        case 8: R4D_IJG_HC(8);
+        default: return RAD_E_INVAL;
+    }
+#undef R4D_IJG_HC
+#undef R4D_IJG_A
+#undef R4D_IJG_C
+#undef R4D_IJG_K
+}
+
+/* rmsnorm_ihc_junction with the block count chosen: 0 is the op's (the grouped kernel over
+ * ceil(M / G) blocks where junction_grouped says so, else one row a block); -1 forces upstream's
+ * one-row kernel; 1..M runs the grouped kernel over that many blocks wherever it is instantiated
+ * (tail, even hc, G rows in kJuncLdsBytes), else the one-row kernel. A row's bytes are the same in
+ * every case; the card-less tests (tests/r4d_emu/test_hy4.cpp) vary the count. */
+extern "C" int r4d_rmsnorm_ihc_junction_nb(const RadArgs* a, RadStream s, long nblocks) {
+    R4dIhcJunction j;
+    const int rc = r4d_ihc_junction_args(a, &j);
+    if (rc != RAD_OK) return R4D_NO(rc);
+    const bool add = j.b != nullptr;
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0;
+    const int g = junction_group(j.hc);
+    if (nblocks == 0 && junction_grouped(j.M, j.r.n, j.tail, j.hc))
+        nblocks = (long)((j.M + g - 1) / g);
+    else if (nblocks > j.M || nblocks < -1) return R4D_NO(RAD_E_INVAL);
+    if (nblocks > 0 && junction_grouped(kJuncGroupMinRows, j.r.n, j.tail, j.hc))
+        return ihc_junction_launch_group(j, s, add, ch, (uint32_t)nblocks);
+    return ihc_junction_launch_rows(j, s, add, ch);
+}
+
+extern "C" int r4d_rad_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
+    return r4d_rmsnorm_ihc_junction_nb(a, s, 0);
 }

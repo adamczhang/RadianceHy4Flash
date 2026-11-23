@@ -9,6 +9,7 @@
 #include "r4d_plugin.h"
 #include "ref_host.h"
 #include "../hy4_dfly_cases.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -671,11 +672,116 @@ static void ihc_junction() {
     }
 }
 
+/* ---- K-46: the junction's rows in groups (r4d_ihc_bf16.hip's ihc_junction_group_kernel over
+ * r4d_ihc.h's junction_walk, long prefill only) against upstream's one-row kernel, byte for byte.
+ * The reference is the launch at nblocks -1 (ihc_junction_kernel, one row a block, junction_row);
+ * each other count runs the grouped kernel over that many blocks where it exists (tail, hc 2/4/8,
+ * G rows in 48 KiB) and the one-row kernel elsewhere: 0 (the op's default: grouped from 2048 rows),
+ * M (one row a block inside the grouped kernel), ceil(M / 2) (one group a block), ceil(M / 4),
+ * the two-rank twin's min(M, 512) and the four-rank twin's min(M, 64) partitions (and each one
+ * fewer, the off-cliff step), and 1 (every row in one block: groups, then a lone tail row). Rows 1 to
+ * 2049, odd counts among them; hc 2, 3, 4, 5, 7 and 8, the head, the add, tail 0 (no group), the
+ * widest grouped row (n 12288) and one past it (16384), y/x stored and G-3b's codes. The bytes
+ * compared: a, h, post, xn, y, x, xq and xs. */
+extern "C" int r4d_rmsnorm_ihc_junction_nb(const RadArgs* a, RadStream s, long nblocks);
+static void ihc_junction_groups() {
+    struct G { int64_t hc, n, M; bool add, ys, tail, head, codes; };
+    const G cases[] = {
+        { 4, 3072, 1, true, true, true, false, true },     { 4, 3072, 7, true, true, true, false, true },
+        { 4, 1024, 13, false, false, true, false, false }, { 4, 512, 64, true, true, true, true, false },
+        { 2, 128, 130, false, true, true, false, true },   { 8, 256, 9, true, true, true, false, false },
+        { 8, 128, 5, false, false, true, true, true },     { 2, 128, 6, true, true, false, false, false },
+        { 4, 8192, 7, false, true, true, false, false },   { 4, 12288, 5, true, false, true, false, true },
+        { 4, 16384, 3, true, false, true, false, false },  { 2, 128, 1026, true, false, true, false, true },
+        { 4, 256, 2048, false, true, true, false, false }, { 4, 128, 2049, true, true, true, false, true },
+        { 8, 128, 2049, false, true, true, false, false }, { 2, 128, 2048, true, false, true, true, false },
+        { 4, 128, 2048, true, true, false, false, false }, /* tail 0 at the grouped height: one-row */
+        { 7, 64, 6, true, true, true, false, false },      { 3, 64, 2048, true, true, true, false, false },
+        { 5, 64, 11, false, true, true, true, false },     /* odd hc: one row a block at every count */
+    };
+    for (const G& g : cases) {
+        Rng rng((uint32_t)(g.hc * 31 + g.n + 7 * g.M));
+        const int64_t M = g.M, n = g.n, hc = g.hc, W = hc * n, rows = g.head ? hc : 2 * hc;
+        const bool post = !g.head, codes = g.codes && g.tail;
+        std::vector<uint16_t> A((size_t)(M * n)), B((size_t)(M * n)), H((size_t)(M * W));
+        for (auto& v : A) v = f2b(rng.n() * 1.5f);
+        for (auto& v : B) v = f2b(rng.n() * 1.5f);
+        for (auto& v : H) v = f2b(rng.n() * 2);
+        std::vector<float> wp((size_t)n), wn((size_t)n), P((size_t)(M * hc)), fn((size_t)(rows * W)),
+            base((size_t)rows), scale = { 3.0f, 2.1f };
+        for (auto& v : wp) v = 1.0f + rng.n() * 0.4f;
+        for (auto& v : wn) v = 1.0f + rng.n() * 0.4f;
+        for (auto& v : P) v = 0.5f + rng.u();
+        for (auto& v : fn) v = rng.n() * 0.05f;
+        for (auto& v : base) v = rng.n() * 0.7f;
+        struct Out { std::vector<uint16_t> a, h, xn, y, x; std::vector<float> p, xs; std::vector<int8_t> xq; };
+        auto run = [&](long nb, Out& o) {
+            o.a = A; o.h = H; o.p = P;
+            o.xn.assign((size_t)(M * n), 0x7e7e); o.y.assign((size_t)(M * n), 0x7e7e);
+            o.x.assign((size_t)(M * n), 0x7e7e);
+            o.xq.assign((size_t)(M * n), 0x5a); o.xs.assign((size_t)(M * (n / 128 > 0 ? n / 128 : 1)), -7.0f);
+            RadTensor t[14] = {
+                t2(o.a.data(), RAD_BF16, M, n, n), g.add ? t2(B.data(), RAD_BF16, M, n, n) : RadTensor{},
+                t1(wp.data(), RAD_F32, n), t2(o.p.data(), RAD_F32, M, hc, hc), t2(o.h.data(), RAD_BF16, M, W, W),
+                g.tail ? t2(fn.data(), RAD_F32, rows, W, W) : RadTensor{},
+                g.tail ? t1(scale.data(), RAD_F32, post ? 2 : 1) : RadTensor{},
+                g.tail ? t1(base.data(), RAD_F32, rows) : RadTensor{},
+                g.tail ? t1(wn.data(), RAD_F32, n) : RadTensor{},
+                g.tail ? t2(o.xn.data(), RAD_BF16, M, n, n) : RadTensor{},
+                g.ys ? t2(o.y.data(), RAD_BF16, M, n, n) : RadTensor{},
+                g.ys && g.tail ? t2(o.x.data(), RAD_BF16, M, n, n) : RadTensor{},
+                codes ? t2(o.xq.data(), RAD_I8, M, n, n) : RadTensor{},
+                codes ? t2(o.xs.data(), RAD_F32, M, n / 128, n / 128) : RadTensor{} };
+            std::vector<RadParam> p = { pi("M", M), pi("n", n), pi("hc", hc), pi("rows", rows), pf("eps", 1e-6),
+                                        pf("ihc_eps", 1e-5), pf("hc_eps", 1e-6), pi("tail", g.tail ? 1 : 0),
+                                        ps("dtype", "bf16") };
+            if (post) p.push_back(pf("post_mag", 2.0));
+            RadArgs a{}; a.t = t; a.n_t = 14; a.p = p.data(); a.n_p = (int)p.size(); a.world_size = 1;
+            return r4d_rmsnorm_ihc_junction_nb(&a, nullptr, nb);
+        };
+        Out ref;
+        char w[200];
+        std::snprintf(w, sizeof w, "junction rows in groups hc %lld n %lld M %lld%s%s%s%s%s", (long long)hc,
+                      (long long)n, (long long)M, g.add ? " add" : "", g.tail ? "" : " tail 0", g.head ? " head" : "",
+                      g.ys ? " y/x stored" : "", codes ? " codes" : "");
+        ++g_cases;
+        if (run(-1, ref) != RAD_OK) { std::printf("FAIL %s: the one-row launch\n", w); ++g_fails; continue; }
+        std::vector<long> nbs = { 0, (long)M, (long)((M + 1) / 2), (long)((M + 3) / 4), std::min<long>(M, 512),
+                                  std::min<long>(M, 511), std::min<long>(M, 64), std::min<long>(M, 63), 1 };
+        std::sort(nbs.begin(), nbs.end());
+        nbs.erase(std::unique(nbs.begin(), nbs.end()), nbs.end());
+        long bad = 0;
+        std::string counts;
+        for (long nb : nbs) {
+            Out o;
+            if (run(nb, o) != RAD_OK) { std::printf("  launch at %ld block(s) refused\n", nb); ++bad; continue; }
+            auto cmpv = [&](const void* x, const void* y, size_t bytes, const char* what) {
+                if (std::memcmp(x, y, bytes)) { std::printf("  %ld block(s): %s differs\n", nb, what); ++bad; }
+            };
+            cmpv(o.a.data(), ref.a.data(), ref.a.size() * 2, "a");
+            cmpv(o.h.data(), ref.h.data(), ref.h.size() * 2, "h");
+            cmpv(o.p.data(), ref.p.data(), ref.p.size() * 4, "post");
+            cmpv(o.xn.data(), ref.xn.data(), ref.xn.size() * 2, "xn");
+            cmpv(o.y.data(), ref.y.data(), ref.y.size() * 2, "y");
+            cmpv(o.x.data(), ref.x.data(), ref.x.size() * 2, "x");
+            cmpv(o.xq.data(), ref.xq.data(), ref.xq.size(), "xq");
+            cmpv(o.xs.data(), ref.xs.data(), ref.xs.size() * 4, "xs");
+            counts += nb == 0 ? std::string(" default") : " " + std::to_string(nb);
+        }
+        /* the reference wrote what it should: h moved, and xn (tail) */
+        if (!std::memcmp(ref.h.data(), H.data(), H.size() * 2)) { std::printf("  h unwritten\n"); ++bad; }
+        if (g.tail) for (auto v : ref.xn) if (v == 0x7e7e) { std::printf("  xn unwritten\n"); ++bad; break; }
+        if (bad) { std::printf("FAIL %s\n", w); ++g_fails; }
+        else std::printf("ok   %s vs the one-row kernel, at%s block(s)\n", w, counts.empty() ? " no other" : counts.c_str());
+    }
+}
+
 int main() {
     ihc_pre();
     ihc_post();
     ihc_pre_order();
     ihc_junction();
+    ihc_junction_groups();
     gate_mul();
     mla_kv();
     engram_ids();
