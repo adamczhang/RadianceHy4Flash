@@ -908,7 +908,7 @@ extern "C" int r4d_fuse_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, uint64_
 
 /* ==========================================================================================
  * rmsnorm_ihc_junction -- [add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm].
- * (kernel: libr4d/r4d_ihc_bf16.hip, ihc_junction_kernel over r4d_ihc.h's junction_row)
+ * (kernel: libr4d/r4d_ihc_bf16.hip, ihc_junction_kernel over r4d_ihc.h's junction_walk)
  *
  * Operands: [0] a (inout)  [1] b?  [2] w_post  [3] post (inout)  [4] h (inout)  [5] fn?  [6] scale?
  *           [7] base?  [8] w_next?  [9] xn?  [10] y?  [11] x?  [12] xq?  [13] xs?

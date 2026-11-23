@@ -102,49 +102,51 @@ __global__ __launch_bounds__(kThreads) void ihc_pre_kernel(R4D_IHC_PRE_PARAMS) {
     if (CH::on) r4d_chain_done();
 }
 
-// rmsnorm_ihc_junction: `[add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm]` a token row a
-// workgroup of 512 threads (r4d_ihc.h's junction_row), byte-identical to add_bf16, rmsnorm_bf16,
+// rmsnorm_ihc_junction: `[add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm]` over token rows at
+// 512 threads a workgroup (r4d_ihc.h's junction_walk), byte-identical to add_bf16, rmsnorm_bf16,
 // ihc_post_bf16, ihc_pre_bf16 and rmsnorm_bf16 in sequence. ADD: the row is bf16(a + b), stored
 // back into `a` as add_bf16 stores it. TAIL 0 stops behind the write (an Engram in front of the
-// next layer writes h between). LDS: n bf16 (the row, then x) + about 0.9 KiB; no scratch.
+// next layer writes h between). Block bk of `nbw` working blocks owns the rows [bk * M / nbw,
+// (bk + 1) * M / nbw) (the launch's grid may be larger, off the cliff; the blocks past nbw idle):
+// one each below ihc_junction_blocks' floor, else groups of up to junction_group(HC) sharing their
+// fn reads (K-46). A row's bytes do not depend on the partition. LDS: junction_lds's rows of n bf16
+// (the row, then x) + the JuncLds; no scratch buffer.
 template <int HC, bool POST, bool TAIL, bool ADD>
 __device__ __forceinline__ void ihc_junction_body(
-    uint16_t* __restrict__ a, const uint16_t* __restrict__ b, JuncRow r, uint64_t ap, uint64_t bp,
-    uint64_t pp, uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp) {
+    uint16_t* __restrict__ a, const uint16_t* __restrict__ b, const JuncRow& r, uint64_t ap,
+    uint64_t bp, uint64_t pp, uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp, uint32_t M,
+    uint32_t nbw) {
     R4D_DYN_LDS(uint4, jbuf);
-    __shared__ JuncLds<HC, POST> L;
-    uint16_t* const ybuf = (uint16_t*)jbuf;
-    const uint64_t row = blockIdx.x;
-    uint16_t* __restrict__ ar = a + row * ap;
-    for (uint32_t q = threadIdx.x; q < r.n / 8u; q += kThreads) {
-        uint4 w = *(const uint4*)(ar + 8u * q);
-        if (ADD) {
-            float u[8], v[8];
-            unpack8(w, u);
-            unpack8(*(const uint4*)(b + row * bp + 8u * q), v);
-            uint16_t o[8];
+    __shared__ JuncLds<HC, POST> L[TAIL ? junction_group(HC) : 1];
+    const uint64_t bk = blockIdx.x;
+    const int r0 = (int)(bk * M / nbw), r1 = (int)((bk + 1) * M / nbw);
+    junction_walk<HC, POST, TAIL>(L, (uint16_t*)jbuf, r, r0, r1, pp, hp, xnp, yp, xp,
+                                  [&](int row, uint16_t* buf) {
+        uint16_t* __restrict__ ar = a + (uint64_t)row * ap;
+        for (uint32_t q = threadIdx.x; q < r.n / 8u; q += kThreads) {
+            uint4 w = *(const uint4*)(ar + 8u * q);
+            if (ADD) {
+                float u[8], v[8];
+                unpack8(w, u);
+                unpack8(*(const uint4*)(b + (uint64_t)row * bp + 8u * q), v);
+                uint16_t o[8];
 #pragma unroll
-            for (int e = 0; e < 8; ++e) o[e] = f32_to_bf16(u[e] + v[e]);
-            w = pack8(o);
-            *(uint4*)(ar + 8u * q) = w;
+                for (int e = 0; e < 8; ++e) o[e] = f32_to_bf16(u[e] + v[e]);
+                w = pack8(o);
+                *(uint4*)(ar + 8u * q) = w;
+            }
+            ((uint4*)buf)[q] = w;
         }
-        jbuf[q] = w;
-    }
-    r.post_row += row * pp;
-    r.hr += row * hp;
-    if (TAIL) r.xnr += row * xnp;
-    if (r.cq) { r.cq += row * r.cqp; r.cs += row * r.csp; }
-    if (r.yr) r.yr += row * yp;
-    if (r.xr) r.xr += row * xp;
-    junction_row<HC, POST, TAIL>(L, ybuf, r);
+    });
 }
 
 template <int HC, bool POST, bool TAIL, bool ADD, class CH>
 __global__ __launch_bounds__(kThreads) void ihc_junction_kernel(
     uint16_t* __restrict__ a, const uint16_t* __restrict__ b, JuncRow r, uint64_t ap, uint64_t bp,
-    uint64_t pp, uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp, uint32_t M) {
+    uint64_t pp, uint64_t hp, uint64_t xnp, uint64_t yp, uint64_t xp, uint32_t M, uint32_t nbw) {
     if (CH::on) r4d_chain_wait();
-    if (blockIdx.x < M) ihc_junction_body<HC, POST, TAIL, ADD>(a, b, r, ap, bp, pp, hp, xnp, yp, xp);
+    if (blockIdx.x < nbw)
+        ihc_junction_body<HC, POST, TAIL, ADD>(a, b, r, ap, bp, pp, hp, xnp, yp, xp, M, nbw);
     if (CH::on) r4d_chain_done();
 }
 // h[j][i] = bf16(post[j] * y[i] + h[j][i]). The product is its own f32 rounding, as libref's.
@@ -479,18 +481,24 @@ int r4d_ihc_junction_args(const RadArgs* a, r4d_ihc::R4dIhcJunction* o) {
     return RAD_OK;
 }
 
-extern "C" int r4d_rad_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
+/* rmsnorm_ihc_junction over `nblocks` working blocks (1..M), or ihc_junction_blocks' count when
+ * nblocks is 0 (the op's entry below). A row's bytes do not depend on the count, which the card-less
+ * tests (tests/r4d_emu/test_hy4.cpp) vary to run the TP1, two-rank and four-rank partitions. */
+extern "C" int r4d_rmsnorm_ihc_junction_nb(const RadArgs* a, RadStream s, long nblocks) {
     R4dIhcJunction j;
     const int rc = r4d_ihc_junction_args(a, &j);
     if (rc != RAD_OK) return R4D_NO(rc);
     const bool add = j.b != nullptr;
     const bool ch = r4d_geti_or(a, "chain", 0) != 0;
-    const uint32_t lds = j.r.n * 2u;
-    const uint32_t grid = r4d_cliff_rows((uint32_t)j.M, 1, kWaves);   /* see ihc_pre_kernel */
+    if (nblocks == 0) nblocks = (long)ihc_junction_blocks(j.M, j.r.n, j.tail, j.hc);
+    if (nblocks < 1 || nblocks > j.M) return R4D_NO(RAD_E_INVAL);
+    const uint32_t nbw = (uint32_t)nblocks;
+    const uint32_t lds = junction_lds(j.r.n, j.tail, j.hc, j.M, nbw);
+    const uint32_t grid = r4d_cliff_rows(nbw, 1, kWaves);   /* see ihc_pre_kernel */
 #define R4D_IJ_K(HC_, PO_, TA_, AD_, CH_)                                                          \
     R4D_EMIT(s, (ihc_junction_kernel<HC_, PO_, TA_, AD_, CH_>), dim3(grid),                       \
              dim3(kThreads), lds, j.a, j.b, j.r, (uint64_t)j.ap, (uint64_t)j.bp, (uint64_t)j.pp,  \
-             (uint64_t)j.hp, (uint64_t)j.xnp, (uint64_t)j.yp, (uint64_t)j.xp, (uint32_t)j.M)
+             (uint64_t)j.hp, (uint64_t)j.xnp, (uint64_t)j.yp, (uint64_t)j.xp, (uint32_t)j.M, nbw)
 #define R4D_IJ_C(HC_, PO_, TA_, AD_)                                                               \
     (ch ? R4D_IJ_K(HC_, PO_, TA_, AD_, r4dchain) : R4D_IJ_K(HC_, PO_, TA_, AD_, R4dUnchained))
 #define R4D_IJ_A(HC_, PO_, TA_) (add ? R4D_IJ_C(HC_, PO_, TA_, true) : R4D_IJ_C(HC_, PO_, TA_, false))
@@ -510,4 +518,8 @@ extern "C" int r4d_rad_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
 #undef R4D_IJ_A
 #undef R4D_IJ_C
 #undef R4D_IJ_K
+}
+
+extern "C" int r4d_rad_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
+    return r4d_rmsnorm_ihc_junction_nb(a, s, 0);
 }

@@ -25,7 +25,8 @@
 //     wire is never taken here.
 //
 // The fold reads every source of a word before it stores it, by the thread that pushed it; no peer
-// reads this rank's `a`, so in place is safe. 512 threads a block; LDS n bf16 + about 1 KiB.
+// reads this rank's `a`, so in place is safe. 512 threads a block; LDS junction_lds's rows of n
+// bf16 (a group's when a block owns several rows, K-46) + the JuncLds, at most about 5 KiB.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
@@ -101,25 +102,18 @@ __device__ __forceinline__ int4 arij_add(const int4 a, const uint16_t* b) {
     return make_int4((int)w.x, (int)w.y, (int)w.z, (int)w.w);
 }
 
-// The rows [r0, r1) of `a`, reduced, through the junction one by one.
+// The rows [r0, r1) of `a`, reduced, through the junction (r4d_ihc.h's junction_walk: groups of
+// junction_tile rows sharing their fn reads, K-46, then one by one; a row's bytes are the same).
 template <int HC, bool POST, bool TAIL>
-__device__ __forceinline__ void arij_rows(JuncLds<HC, POST>& L, uint16_t* ybuf, uint16_t* a,
-                                          JuncRow r, int r0, int r1, uint64_t pp, uint64_t hp,
+__device__ __forceinline__ void arij_rows(JuncLds<HC, POST>* L, uint16_t* ybuf, uint16_t* a,
+                                          const JuncRow& r, int r0, int r1, uint64_t pp, uint64_t hp,
                                           uint64_t xnp, uint64_t yp, uint64_t xp) {
-    const uint32_t n = r.n, wpr = n / 8u;
-    for (int row = r0; row < r1; ++row) {
-        const uint4* ar = (const uint4*)(a + (size_t)row * n);
-        for (uint32_t q = threadIdx.x; q < wpr; q += kThreads) ((uint4*)ybuf)[q] = ar[q];
-        JuncRow t = r;
-        t.post_row += (size_t)row * pp;
-        t.hr += (size_t)row * hp;
-        if (TAIL) t.xnr += (size_t)row * xnp;
-        if (t.cq) { t.cq += (size_t)row * t.cqp; t.cs += (size_t)row * t.csp; }
-        if (t.yr) t.yr += (size_t)row * yp;
-        if (t.xr) t.xr += (size_t)row * xp;
-        junction_row<HC, POST, TAIL>(L, ybuf, t);
-        __syncthreads();   /* ybuf and L are the next row's */
-    }
+    const uint32_t wpr = r.n / 8u;
+    junction_walk<HC, POST, TAIL>(L, ybuf, r, r0, r1, pp, hp, xnp, yp, xp,
+                                  [&](int row, uint16_t* buf) {
+        const uint4* ar = (const uint4*)(a + (size_t)row * r.n);
+        for (uint32_t q = threadIdx.x; q < wpr; q += kThreads) ((uint4*)buf)[q] = ar[q];
+    });
 }
 
 #define R4D_ARIJ_ROWPARAMS                                                                         \
@@ -135,7 +129,7 @@ __global__ __launch_bounds__(kThreads) void ar_ihc_junction_2rank_kernel(
     unsigned int nbw, long stage) {
     if (CH::on) r4d_chain_wait();
     R4D_DYN_LDS(uint4, jbuf);
-    __shared__ JuncLds<HC, POST> L;
+    __shared__ JuncLds<HC, POST> L[TAIL ? junction_group(HC) : 1];
     __shared__ unsigned int s_seq, s_slot;
     const int bk = (int)blockIdx.x, nb = (int)gridDim.x;
     const int tid = (int)threadIdx.x, lane = tid & 31;
@@ -225,7 +219,7 @@ __global__ __launch_bounds__(kThreads) void ar_ihc_junction_4rank_kernel(
         peers.rank[p] = pa.rank[p];
     }
     R4D_DYN_LDS(uint4, jbuf);
-    __shared__ JuncLds<HC, POST> L;
+    __shared__ JuncLds<HC, POST> L[TAIL ? junction_group(HC) : 1];
     __shared__ unsigned int s_seq, s_slot;
     const int bk = (int)blockIdx.x, nb = (int)gridDim.x, tid = (int)threadIdx.x;
     const int r0 = (int)(((long)bk * M) / nb), r1 = (int)(((long)(bk + 1) * M) / nb);
@@ -293,7 +287,7 @@ extern "C" int r4d_ar_ihc_junction_2rank(long peer_scratch, long my_scratch, lon
     nb = arij_off_cliff(nb);
     const bool ch = chain != 0;
     const bool add = j.b != nullptr;
-    const uint32_t lds = j.r.n * 2u;
+    const uint32_t lds = junction_lds(j.r.n, j.tail, j.hc, M, nb);
 #define R4D_ARIJ2_K(HC_, PO_, TA_, AD_, CO_, CH_)                                                  \
     R4D_EMIT((RadStream)stream, (ar_ihc_junction_2rank_kernel<HC_, PO_, TA_, AD_, CO_, CH_>),     \
              dim3((uint32_t)nb), dim3(kThreads), lds, j.a, j.b, j.r, (uint64_t)j.bp,               \
@@ -369,7 +363,7 @@ extern "C" int r4d_ar_ihc_junction_4rank(long peer_scratch0, long peer_scratch1,
     }
     const bool ch = chain != 0;
     const bool add = j.b != nullptr;
-    const uint32_t lds = j.r.n * 2u;
+    const uint32_t lds = junction_lds(j.r.n, j.tail, j.hc, M, nb);
 #define R4D_ARIJ4_K(HC_, PO_, TA_, AD_, CH_)                                                       \
     R4D_EMIT((RadStream)stream, (ar_ihc_junction_4rank_kernel<HC_, PO_, TA_, AD_, CH_>),          \
              dim3((uint32_t)nb), dim3(kThreads), lds, j.a, j.b, j.r, (uint64_t)j.bp,               \
